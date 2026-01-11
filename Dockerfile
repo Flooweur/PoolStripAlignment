@@ -20,17 +20,20 @@ WORKDIR /source
 # This means NuGet restore is cached if project file doesn't change
 COPY src/PoolStripProcessor.csproj ./src/
 
-# Restore NuGet packages
-RUN dotnet restore src/PoolStripProcessor.csproj
+# Restore NuGet packages for Linux x64 runtime
+RUN dotnet restore src/PoolStripProcessor.csproj -r linux-x64
 
 # Copy the rest of the source code
 COPY src/ ./src/
 
-# Build the application in Release mode
+# Build the application in Release mode for Linux x64
+# RuntimeIdentifier ensures native OpenCvSharp libraries are included
 RUN dotnet publish src/PoolStripProcessor.csproj \
     -c Release \
+    -r linux-x64 \
     -o /app/publish \
-    --no-restore
+    --no-restore \
+    --self-contained false
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime Stage
@@ -50,19 +53,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libtiff6 \
     libwebp7 \
     # Video/media libraries (required by OpenCV)
-    libavcodec60 \
-    libavformat60 \
-    libswscale7 \
+    libavcodec59 \
+    libavformat59 \
+    libswscale6 \
     # Threading
     libgomp1 \
     # Tesseract OCR (required by OpenCvSharp even if not used)
     libtesseract5 \
-    libleptonica-dev \
+    liblept5 \
     # General dependencies
     libgdiplus \
     && rm -rf /var/lib/apt/lists/* \
-    # Create symlinks for library version compatibility
-    && ln -sf /usr/lib/x86_64-linux-gnu/libtesseract.so.5 /usr/lib/x86_64-linux-gnu/libtesseract.so.4 || true
+    # Create symlinks for library version compatibility (Debian 12 has libtesseract5, OpenCvSharp needs libtesseract4)
+    && ln -sf /usr/lib/x86_64-linux-gnu/libtesseract.so.5 /usr/lib/x86_64-linux-gnu/libtesseract.so.4 \
+    && ldconfig
 
 # Set working directory
 WORKDIR /app
