@@ -6,17 +6,20 @@ A .NET 8 microservice that processes images of pool test strips by correcting th
 
 This microservice provides a simple REST API that accepts photos of pool test strips and:
 
-1. **Detects** the test strip in the image
-2. **Corrects orientation** to make the strip vertical and pointing upwards
+1. **Detects** the test strip in the image using contour analysis
+2. **Corrects orientation** to make the strip vertical (with minimal rotation)
 3. **Crops** the image to only include the test strip
 4. **Returns** the processed image in PNG format
 
+> **Note**: The algorithm makes the strip vertical but cannot determine which end is "up" without application-specific knowledge about the test pad color patterns. The strip will be oriented vertically with the smallest rotation angle applied.
+
 ## Features
 
-- ✅ Automatic strip detection using image analysis
-- ✅ Orientation correction using image moments algorithm
-- ✅ Automatic cropping to strip area
+- ✅ Automatic strip detection using edge detection and contour analysis
+- ✅ Orientation correction using minAreaRect and rotation transformation
+- ✅ Automatic cropping to strip area with configurable padding
 - ✅ Support for multiple image formats (JPEG, PNG, GIF, WebP, BMP)
+- ✅ Otsu's thresholding for robust detection under varying lighting
 - ✅ Docker-ready with multi-stage build
 - ✅ Swagger/OpenAPI documentation
 - ✅ Health check endpoint for container orchestration
@@ -106,31 +109,40 @@ Invoke-RestMethod -Uri "http://localhost:5000/process" `
 
 ## Algorithm Details
 
-The image processing uses several computer vision techniques:
+The image processing uses the following computer vision pipeline (OpenCV-based):
 
-### 1. Grayscale Conversion
-The image is converted to grayscale using the luminance formula:
+### 1. Preprocessing
+- **Grayscale Conversion**: Using OpenCV's BGR2GRAY color conversion
+- **Gaussian Blur**: 5x5 kernel to reduce noise while preserving edges
+- **Otsu's Thresholding**: Automatically determines optimal threshold for binarization
+
+### 2. Edge Detection & Contour Finding
+- **Canny Edge Detection**: Dual threshold (50, 150) for robust edge detection
+- **Morphological Dilation**: Closes gaps in contours (3x3 kernel, 2 iterations)
+- **Contour Extraction**: External contours only (RetrievalModes.External)
+
+### 3. Strip Identification
+- **Contour Scoring**: Prefers elongated shapes with large area
+- **MinAreaRect**: Gets the minimum area rotated bounding box for the strip
+- Returns center, size (width, height), and rotation angle
+
+### 4. Rotation Angle Calculation
+The rotation angle is calculated to make the strip's long axis vertical:
 ```
-Y = 0.299×R + 0.587×G + 0.114×B
+1. Determine long axis direction from minAreaRect
+2. Calculate angle from horizontal: θ_long = angle + 90° (if height > width)
+3. Rotation needed = 90° - θ_long (normalized to [-90°, 90°])
 ```
 
-### 2. Otsu's Thresholding
-Automatically determines the optimal threshold to separate the strip from the background by minimizing intra-class variance. This adapts to different lighting conditions.
+### 5. Image Rotation
+- **Affine Transformation**: Using OpenCV's GetRotationMatrix2D and WarpAffine
+- **Canvas Expansion**: Output canvas is expanded to fit the rotated image
+- **Border Handling**: White background fill for clean edges
 
-### 3. Image Moments
-Calculates statistical moments of the binary image:
-- **M00**: Total area (pixel count)
-- **M10, M01**: First moments (for centroid calculation)
-- **M20, M02, M11**: Second moments (for orientation calculation)
-
-### 4. Orientation Angle
-The principal axis angle is calculated from central moments:
-```
-θ = 0.5 × atan2(2×μ11, μ20 - μ02)
-```
-
-### 5. Rotation & Cropping
-The image is rotated to make the strip vertical, then cropped to the bounding box of the strip area with a small padding.
+### 6. Re-detection & Cropping
+- Strip is re-detected in the rotated image for accurate bounds
+- Crop rectangle is calculated with configurable padding (default: 10px)
+- Final image is extracted and encoded as PNG
 
 ## Project Structure
 
@@ -237,7 +249,7 @@ docker-compose build --no-cache
 
 - **.NET 8**: Runtime and framework
 - **ASP.NET Core Minimal APIs**: Web framework
-- **SixLabors.ImageSharp**: Cross-platform image processing
+- **OpenCvSharp4**: .NET bindings for OpenCV (computer vision library)
 - **Docker**: Containerization
 - **Swagger/OpenAPI**: API documentation
 

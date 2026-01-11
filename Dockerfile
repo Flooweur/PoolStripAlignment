@@ -38,16 +38,31 @@ RUN dotnet publish src/PoolStripProcessor.csproj \
 # Use the smaller ASP.NET runtime image (not the full SDK)
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 
-# Install OpenCV dependencies required by OpenCvSharp4
-# libopencv-dev includes all OpenCV shared libraries
-# libleptonica and libtesseract are required for OpenCvSharp's text detection features
+# Install dependencies required by OpenCvSharp4.runtime.linux-x64
+# The OpenCvSharp NuGet package bundles its own native OpenCV libraries,
+# but they depend on system libraries for image codecs, threading, etc.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgdiplus \
-    libc6-dev \
+    # For health check
+    curl \
+    # Image codec libraries
+    libpng16-16 \
+    libjpeg62-turbo \
+    libtiff6 \
+    libwebp7 \
+    # Video/media libraries (required by OpenCV)
+    libavcodec60 \
+    libavformat60 \
+    libswscale7 \
+    # Threading
     libgomp1 \
+    # Tesseract OCR (required by OpenCvSharp even if not used)
+    libtesseract5 \
     libleptonica-dev \
-    libtesseract-dev \
-    && rm -rf /var/lib/apt/lists/*
+    # General dependencies
+    libgdiplus \
+    && rm -rf /var/lib/apt/lists/* \
+    # Create symlinks for library version compatibility
+    && ln -sf /usr/lib/x86_64-linux-gnu/libtesseract.so.5 /usr/lib/x86_64-linux-gnu/libtesseract.so.4 || true
 
 # Set working directory
 WORKDIR /app
