@@ -1,0 +1,67 @@
+# ============================================================================
+# Pool Test Strip Processor - Docker Compose Configuration
+# ============================================================================
+# 
+# Usage:
+#   Build and start:  docker-compose up --build
+#   Start (detached): docker-compose up -d
+#   Stop:             docker-compose down
+#   View logs:        docker-compose logs -f
+#   Rebuild:          docker-compose build --no-cache
+#
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # --------------------------------------------------------------------------
+  # Pool Strip Processor API
+  # --------------------------------------------------------------------------
+  pool-strip-processor:
+    # Build from the Dockerfile in the current directory
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    # Container name for easy reference
+    container_name: pool-strip-processor
+
+    # Port mapping: host:container
+    # Access the API at http://localhost:5000
+    ports:
+      - "5000:8080"
+
+    # Environment variables
+    environment:
+      # Set to Development for more verbose logging and Swagger UI
+      - ASPNETCORE_ENVIRONMENT=Production
+      # Logging level (Trace, Debug, Information, Warning, Error, Critical)
+      - Logging__LogLevel__Default=Information
+      - Logging__LogLevel__Microsoft.AspNetCore=Warning
+
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          # Limit memory usage (image processing can be memory-intensive)
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    # Restart policy
+    restart: unless-stopped
+
+    # Health check (matches the Dockerfile HEALTHCHECK)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
