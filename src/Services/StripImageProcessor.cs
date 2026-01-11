@@ -8,17 +8,24 @@ namespace PoolStripProcessor.Services;
 /// ALGORITHM OVERVIEW (Industry-Standard Computer Vision Pipeline):
 /// 1. Load image and convert to grayscale
 /// 2. Apply Gaussian blur to reduce noise
-/// 3. Use Canny edge detection to find edges
-/// 4. Find contours in the edge image
-/// 5. Identify the largest contour (the strip)
-/// 6. Use minAreaRect to get the minimum area rotated bounding box
-/// 7. Rotate the image to make the strip vertical
-/// 8. Crop to the bounding box
+/// 3. Use adaptive thresholding or Otsu's method for robust binarization
+/// 4. Use Canny edge detection to find edges
+/// 5. Find contours in the edge image
+/// 6. Identify the largest elongated contour (the strip)
+/// 7. Use minAreaRect to get the minimum area rotated bounding box
+/// 8. Calculate rotation angle to make the strip vertical
+/// 9. Rotate the image to make the strip vertical
+/// 10. Crop to the bounding box
+/// 
+/// NOTE ON "POINTING UPWARDS":
+/// True orientation detection (determining which end is "up") would require
+/// analyzing the color pattern of the test pads, which is application-specific.
+/// This implementation makes the strip vertical with minimal rotation.
 /// </summary>
 public class StripImageProcessor : IStripImageProcessor
 {
     // Padding to add around the cropped strip (in pixels)
-    private const int CropPadding = 5;
+    private const int CropPadding = 10;
 
     // Canny edge detection thresholds
     private const double CannyThreshold1 = 50;
@@ -26,6 +33,9 @@ public class StripImageProcessor : IStripImageProcessor
 
     // Gaussian blur kernel size (must be odd)
     private const int BlurKernelSize = 5;
+
+    // Minimum aspect ratio to consider a contour as a strip (length/width)
+    private const double MinStripAspectRatio = 2.0;
 
     private readonly ILogger<StripImageProcessor> _logger;
 
@@ -59,21 +69,24 @@ public class StripImageProcessor : IStripImageProcessor
             stripRect.Center.X, stripRect.Center.Y, stripRect.Size.Width, stripRect.Size.Height, stripRect.Angle);
 
         // Step 2: Calculate the rotation angle to make the strip vertical
-        double rotationAngle = CalculateRotationAngle(stripRect);
+        double rotationAngle = CalculateRotationAngleForVertical(stripRect);
         _logger.LogDebug("Rotation angle to make vertical: {Angle}°", rotationAngle);
 
         // Step 3: Rotate the image
         using var rotatedImage = RotateImage(originalImage, rotationAngle);
 
-        // Step 4: Calculate the crop rectangle in the rotated image
-        var cropRect = CalculateCropRectangle(stripRect, rotationAngle, originalImage.Size(), rotatedImage.Size());
+        // Step 4: Re-detect the strip in the rotated image to get accurate crop bounds
+        var rotatedStripRect = DetectStripRect(rotatedImage);
+        
+        // Step 5: Calculate the crop rectangle from the now-vertical strip
+        var cropRect = CalculateCropRectangleFromVerticalStrip(rotatedStripRect, rotatedImage.Size());
         _logger.LogDebug("Crop rectangle: X={X}, Y={Y}, W={Width}, H={Height}",
             cropRect.X, cropRect.Y, cropRect.Width, cropRect.Height);
 
-        // Step 5: Crop the image
+        // Step 6: Crop the image
         using var croppedImage = CropImage(rotatedImage, cropRect);
 
-        // Step 6: Encode and return as PNG
+        // Step 7: Encode and return as PNG
         Cv2.ImEncode(".png", croppedImage, out var outputBytes);
         var outputStream = new MemoryStream(outputBytes);
 
@@ -97,13 +110,17 @@ public class StripImageProcessor : IStripImageProcessor
         using var blurred = new Mat();
         Cv2.GaussianBlur(gray, blurred, new Size(BlurKernelSize, BlurKernelSize), 0);
 
-        // Apply Canny edge detection
-        using var edges = new Mat();
-        Cv2.Canny(blurred, edges, CannyThreshold1, CannyThreshold2);
+        // Apply Otsu's thresholding for better binarization
+        using var binary = new Mat();
+        Cv2.Threshold(blurred, binary, 0, 255, ThresholdTypes.Binary | ThresholdTypes.Otsu);
 
-        // Optional: Dilate edges to close gaps
+        // Apply Canny edge detection on the binary image
+        using var edges = new Mat();
+        Cv2.Canny(binary, edges, CannyThreshold1, CannyThreshold2);
+
+        // Dilate edges to close gaps
         using var dilated = new Mat();
-        var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
+        using var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
         Cv2.Dilate(edges, dilated, kernel, iterations: 2);
 
         // Find contours
@@ -118,127 +135,166 @@ public class StripImageProcessor : IStripImageProcessor
                 0);
         }
 
-        // Find the largest contour by area (this should be the strip)
-        var largestContour = contours
-            .OrderByDescending(c => Cv2.ContourArea(c))
-            .First();
+        // Find the best contour - prefer elongated shapes (strips)
+        RotatedRect? bestRect = null;
+        double bestScore = 0;
 
-        double area = Cv2.ContourArea(largestContour);
-        _logger.LogDebug("Largest contour area: {Area} pixels", area);
+        foreach (var contour in contours)
+        {
+            double area = Cv2.ContourArea(contour);
+            if (area < 100) continue; // Skip tiny contours
 
-        // Get the minimum area rotated rectangle that bounds this contour
-        var minRect = Cv2.MinAreaRect(largestContour);
+            var rect = Cv2.MinAreaRect(contour);
+            
+            // Calculate aspect ratio (always > 1)
+            float longSide = Math.Max(rect.Size.Width, rect.Size.Height);
+            float shortSide = Math.Min(rect.Size.Width, rect.Size.Height);
+            double aspectRatio = shortSide > 0 ? longSide / shortSide : 1;
 
-        return minRect;
+            // Score: prefer large area and elongated shape
+            double score = area * Math.Min(aspectRatio, 10); // Cap aspect ratio contribution
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestRect = rect;
+            }
+        }
+
+        if (bestRect == null)
+        {
+            _logger.LogWarning("No suitable contour found, using largest by area");
+            var largestContour = contours.OrderByDescending(c => Cv2.ContourArea(c)).First();
+            bestRect = Cv2.MinAreaRect(largestContour);
+        }
+
+        double finalArea = bestRect.Value.Size.Width * bestRect.Value.Size.Height;
+        _logger.LogDebug("Selected contour - Area: {Area} pixels, AspectRatio: {AR:F2}", 
+            finalArea,
+            Math.Max(bestRect.Value.Size.Width, bestRect.Value.Size.Height) / 
+            Math.Max(1, Math.Min(bestRect.Value.Size.Width, bestRect.Value.Size.Height)));
+
+        return bestRect.Value;
     }
 
     /// <summary>
     /// Calculates the angle needed to rotate the strip to be vertical.
-    /// OpenCV's minAreaRect returns angles in the range [-90, 0).
+    /// 
+    /// OpenCV minAreaRect angle convention (OpenCV 4.x):
+    /// - Returns a RotatedRect with center, size (width, height), and angle
+    /// - The angle is the rotation angle of the rectangle in degrees
+    /// - Angle is measured counter-clockwise from the horizontal axis to the first side (width)
+    /// - Angle range is typically [-90, 0) but can vary
+    /// 
+    /// To make the long axis vertical:
+    /// 1. Determine which dimension (width or height) is the long axis
+    /// 2. Calculate the current angle of the long axis from vertical
+    /// 3. Return the rotation needed to make it vertical
     /// </summary>
-    private double CalculateRotationAngle(RotatedRect rect)
+    private double CalculateRotationAngleForVertical(RotatedRect rect)
     {
-        double angle = rect.Angle;
         float width = rect.Size.Width;
         float height = rect.Size.Height;
+        double angle = rect.Angle;
 
-        // minAreaRect returns the angle of the rectangle's width edge relative to horizontal
-        // We need to adjust based on which dimension is longer (the strip's length)
+        _logger.LogDebug("MinAreaRect - Width: {W}, Height: {H}, Angle: {A}°", width, height, angle);
+
+        // Determine the angle of the LONG axis from horizontal
+        // In OpenCV's minAreaRect:
+        // - angle is the rotation of the width-edge from horizontal
+        // - If width > height: the long axis is at `angle` degrees from horizontal
+        // - If height > width: the long axis is at `angle + 90` degrees from horizontal
         
-        if (width < height)
+        double longAxisAngleFromHorizontal;
+        
+        if (width >= height)
         {
-            // Height is the long axis (strip is more vertical than horizontal)
-            // Angle is already relative to vertical, just need minor adjustment
-            // OpenCV angle: -90 means vertical, 0 means horizontal
-            angle = angle + 90;
+            // Width is the long axis
+            // The width edge is at `angle` degrees from horizontal
+            longAxisAngleFromHorizontal = angle;
         }
         else
         {
-            // Width is the long axis (strip is more horizontal)
-            // Need to rotate by angle to make it vertical
-            // No adjustment needed, angle directly gives us the rotation
+            // Height is the long axis
+            // The height edge is perpendicular to width, so at `angle + 90` from horizontal
+            longAxisAngleFromHorizontal = angle + 90;
         }
 
-        // Normalize to [-45, 45] range for minimal rotation
-        while (angle > 45) angle -= 90;
-        while (angle < -45) angle += 90;
+        // Normalize to [-180, 180]
+        while (longAxisAngleFromHorizontal > 180) longAxisAngleFromHorizontal -= 360;
+        while (longAxisAngleFromHorizontal <= -180) longAxisAngleFromHorizontal += 360;
 
-        return angle;
+        _logger.LogDebug("Long axis angle from horizontal: {Angle}°", longAxisAngleFromHorizontal);
+
+        // To make the long axis vertical (pointing up or down), we need it at 90° or -90° from horizontal
+        // Calculate rotation needed to reach 90° (vertical)
+        double rotationNeeded = 90 - longAxisAngleFromHorizontal;
+
+        // Normalize to [-90, 90] for minimal rotation
+        // We can rotate by adding/subtracting 180° to flip, but we want minimal rotation
+        while (rotationNeeded > 90) rotationNeeded -= 180;
+        while (rotationNeeded < -90) rotationNeeded += 180;
+
+        _logger.LogDebug("Rotation needed for vertical: {Angle}°", rotationNeeded);
+
+        return rotationNeeded;
     }
 
     /// <summary>
     /// Rotates an image by the specified angle around its center.
     /// The output image is expanded to fit the rotated content.
     /// </summary>
+    /// <param name="image">Source image</param>
+    /// <param name="angle">Rotation angle in degrees (positive = counter-clockwise)</param>
     private Mat RotateImage(Mat image, double angle)
     {
         var center = new Point2f(image.Width / 2f, image.Height / 2f);
         
         // Get the rotation matrix
-        using var rotationMatrix = Cv2.GetRotationMatrix2D(center, -angle, 1.0);
+        // Note: OpenCV's getRotationMatrix2D uses positive angles for counter-clockwise rotation
+        using var rotationMatrix = Cv2.GetRotationMatrix2D(center, angle, 1.0);
         
         // Calculate new image bounds after rotation
-        double cos = Math.Abs(rotationMatrix.At<double>(0, 0));
-        double sin = Math.Abs(rotationMatrix.At<double>(0, 1));
-        int newWidth = (int)(image.Width * cos + image.Height * sin);
-        int newHeight = (int)(image.Width * sin + image.Height * cos);
+        double angleRad = Math.Abs(angle) * Math.PI / 180.0;
+        double cos = Math.Cos(angleRad);
+        double sin = Math.Sin(angleRad);
+        int newWidth = (int)Math.Ceiling(image.Width * cos + image.Height * sin);
+        int newHeight = (int)Math.Ceiling(image.Width * sin + image.Height * cos);
         
-        // Adjust the rotation matrix to account for the new center
-        rotationMatrix.At<double>(0, 2) += (newWidth - image.Width) / 2.0;
-        rotationMatrix.At<double>(1, 2) += (newHeight - image.Height) / 2.0;
+        // Adjust the rotation matrix to account for the translation to the new center
+        double tx = (newWidth - image.Width) / 2.0;
+        double ty = (newHeight - image.Height) / 2.0;
+        rotationMatrix.At<double>(0, 2) += tx;
+        rotationMatrix.At<double>(1, 2) += ty;
 
-        // Apply the rotation
+        // Apply the rotation with white background (better for strips on light backgrounds)
         var rotated = new Mat();
         Cv2.WarpAffine(image, rotated, rotationMatrix, new Size(newWidth, newHeight),
-            InterpolationFlags.Linear, BorderTypes.Constant, Scalar.Black);
+            InterpolationFlags.Linear, BorderTypes.Constant, Scalar.White);
 
         return rotated;
     }
 
     /// <summary>
-    /// Calculates the crop rectangle in the rotated image space.
-    /// Transforms the original bounding box corners through the rotation.
+    /// Calculates the crop rectangle for a now-vertical strip.
+    /// Uses the axis-aligned bounding box of the rotated rectangle.
     /// </summary>
-    private Rect CalculateCropRectangle(RotatedRect originalRect, double rotationAngle,
-        Size originalImageSize, Size rotatedImageSize)
+    private Rect CalculateCropRectangleFromVerticalStrip(RotatedRect stripRect, Size imageSize)
     {
         // Get the 4 corners of the rotated rectangle
-        var corners = originalRect.Points();
+        var corners = stripRect.Points();
 
-        // Transform corners through the rotation
-        double angleRad = -rotationAngle * Math.PI / 180.0;
-        double cos = Math.Cos(angleRad);
-        double sin = Math.Sin(angleRad);
-
-        var origCenter = new Point2f(originalImageSize.Width / 2f, originalImageSize.Height / 2f);
-        var newCenter = new Point2f(rotatedImageSize.Width / 2f, rotatedImageSize.Height / 2f);
-
-        var transformedCorners = new List<Point2f>();
-        foreach (var corner in corners)
-        {
-            // Translate to origin
-            float dx = corner.X - origCenter.X;
-            float dy = corner.Y - origCenter.Y;
-
-            // Rotate
-            float rx = (float)(dx * cos - dy * sin);
-            float ry = (float)(dx * sin + dy * cos);
-
-            // Translate to new center
-            transformedCorners.Add(new Point2f(rx + newCenter.X, ry + newCenter.Y));
-        }
-
-        // Calculate axis-aligned bounding box of transformed corners
-        float minX = transformedCorners.Min(p => p.X);
-        float maxX = transformedCorners.Max(p => p.X);
-        float minY = transformedCorners.Min(p => p.Y);
-        float maxY = transformedCorners.Max(p => p.Y);
+        // Calculate axis-aligned bounding box
+        float minX = corners.Min(p => p.X);
+        float maxX = corners.Max(p => p.X);
+        float minY = corners.Min(p => p.Y);
+        float maxY = corners.Max(p => p.Y);
 
         // Apply padding and clamp to image bounds
         int x = Math.Max(0, (int)Math.Floor(minX) - CropPadding);
         int y = Math.Max(0, (int)Math.Floor(minY) - CropPadding);
-        int right = Math.Min(rotatedImageSize.Width, (int)Math.Ceiling(maxX) + CropPadding);
-        int bottom = Math.Min(rotatedImageSize.Height, (int)Math.Ceiling(maxY) + CropPadding);
+        int right = Math.Min(imageSize.Width, (int)Math.Ceiling(maxX) + CropPadding);
+        int bottom = Math.Min(imageSize.Height, (int)Math.Ceiling(maxY) + CropPadding);
 
         return new Rect(x, y, right - x, bottom - y);
     }
